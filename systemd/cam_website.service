@@ -1,0 +1,19 @@
+[Unit]
+Description=Spinnaker camera website
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=robotik
+Group=robotik
+SupplementaryGroups=flirimaging
+WorkingDirectory=/home/robotik/Documents/cam_website
+ExecStart=/home/robotik/Documents/cam_website/build/cam_website --bind 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
