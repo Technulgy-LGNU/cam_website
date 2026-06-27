@@ -67,8 +67,9 @@ sudo systemctl disable cam_website.service
 ## Notes
 
 - The app uses Spinnaker directly through the native C++ SDK; no Python packages or web frameworks are required.
-- The browser polls `/frame.bmp` for the newest frame and `/status.json` for camera state.
-- If no camera is found or the camera drops, the capture loop retries automatically.
+- The browser polls `/frame.bmp` for the newest frame, `/status.json` for camera state, and `/cameras.json` for hotplug discovery.
+- The camera dropdown switches cameras through `/select?serial=SERIAL` without restarting the process.
+- If no camera is found, a selected camera drops, or a selected camera is not currently reachable, the capture loop retries automatically.
 - For GigE cameras, make sure the camera is reachable on the host network and configured with Spinnaker's GigE tools if it is on the wrong subnet.
 - If acquisition fails with access/capability errors on Linux, run `make rtcap` once. This applies the same `CAP_SYS_NICE,CAP_SYS_RESOURCE,CAP_NET_RAW` capabilities used by Spinnaker's sample Makefiles.
 

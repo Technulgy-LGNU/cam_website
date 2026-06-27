@@ -88,6 +88,51 @@ std::string jsonEscape(const std::string& input)
     return out.str();
 }
 
+std::string urlDecode(const std::string& input)
+{
+    std::string out;
+    out.reserve(input.size());
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        if (input[i] == '%' && i + 2 < input.size())
+        {
+            char hex[3] = {input[i + 1], input[i + 2], '\0'};
+            char* end = nullptr;
+            long value = std::strtol(hex, &end, 16);
+            if (end == hex + 2)
+            {
+                out.push_back(static_cast<char>(value));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(input[i] == '+' ? ' ' : input[i]);
+    }
+    return out;
+}
+
+std::string queryValue(const std::string& query, const std::string& key)
+{
+    size_t start = 0;
+    while (start <= query.size())
+    {
+        size_t end = query.find('&', start);
+        std::string pair = query.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        size_t equals = pair.find('=');
+        std::string name = urlDecode(pair.substr(0, equals));
+        if (name == key)
+        {
+            return equals == std::string::npos ? std::string() : urlDecode(pair.substr(equals + 1));
+        }
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        start = end + 1;
+    }
+    return {};
+}
+
 std::string httpDate()
 {
     char buffer[128];
@@ -217,23 +262,53 @@ struct AppConfig
     std::string serial;
 };
 
+struct CameraInfo
+{
+    std::string serial;
+    std::string model;
+    std::string accessStatus;
+};
+
 class CameraStreamer
 {
   public:
-    explicit CameraStreamer(std::string serial) : serialFilter_(std::move(serial)) {}
+    explicit CameraStreamer(std::string serial) : selectedSerial_(std::move(serial)) {}
 
     void start()
     {
         worker_ = std::thread(&CameraStreamer::captureLoop, this);
+        discoveryWorker_ = std::thread(&CameraStreamer::discoveryLoop, this);
     }
 
     void stop()
     {
         running_ = false;
+        if (discoveryWorker_.joinable())
+        {
+            discoveryWorker_.join();
+        }
         if (worker_.joinable())
         {
             worker_.join();
         }
+    }
+
+    void selectCamera(const std::string& serial)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (serial == selectedSerial_)
+        {
+            return;
+        }
+
+        selectedSerial_ = serial;
+        switchRequested_ = true;
+        connected_ = false;
+        latestBmp_.clear();
+        width_ = 0;
+        height_ = 0;
+        frameId_ = 0;
+        lastError_ = serial.empty() ? "Switching to first available camera" : "Switching to camera " + serial;
     }
 
     bool latestFrame(std::vector<uint8_t>& frame, uint64_t& frameId, size_t& width, size_t& height) const
@@ -261,6 +336,7 @@ class CameraStreamer
         out << "\"width\":" << width_ << ",";
         out << "\"height\":" << height_ << ",";
         out << "\"camera_count\":" << cameraCount_ << ",";
+        out << "\"selected_serial\":\"" << jsonEscape(selectedSerial_) << "\",";
         out << "\"serial\":\"" << jsonEscape(serial_) << "\",";
         out << "\"model\":\"" << jsonEscape(model_) << "\",";
         out << "\"access_status\":\"" << jsonEscape(accessStatus_) << "\",";
@@ -269,7 +345,41 @@ class CameraStreamer
         return out.str();
     }
 
+    std::string camerasJson() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ostringstream out;
+        out << "{";
+        out << "\"selected_serial\":\"" << jsonEscape(selectedSerial_) << "\",";
+        out << "\"active_serial\":\"" << jsonEscape(serial_) << "\",";
+        out << "\"cameras\":[";
+        for (size_t i = 0; i < cameras_.size(); ++i)
+        {
+            if (i > 0)
+            {
+                out << ",";
+            }
+            const CameraInfo& cam = cameras_[i];
+            out << "{";
+            out << "\"serial\":\"" << jsonEscape(cam.serial) << "\",";
+            out << "\"model\":\"" << jsonEscape(cam.model) << "\",";
+            out << "\"access_status\":\"" << jsonEscape(cam.accessStatus) << "\",";
+            out << "\"selected\":" << (cam.serial == selectedSerial_ ? "true" : "false") << ",";
+            out << "\"active\":" << (cam.serial == serial_ && connected_ ? "true" : "false");
+            out << "}";
+        }
+        out << "]}";
+        return out.str();
+    }
+
   private:
+    void updateCameraList(const std::vector<CameraInfo>& cameras)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cameras_ = cameras;
+        cameraCount_ = cameras_.size();
+    }
+
     void setStatus(bool connected, const std::string& error)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -283,7 +393,53 @@ class CameraStreamer
         }
     }
 
-    CameraPtr chooseCamera(CameraList& camList)
+    std::string selectedSerial() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return selectedSerial_;
+    }
+
+    bool shouldSwitch(const std::string& activeSerial) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return switchRequested_ || (!selectedSerial_.empty() && selectedSerial_ != activeSerial);
+    }
+
+    void markCameraOpened(const std::string& serial, const std::string& model, const std::string& accessStatus)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        serial_ = serial;
+        model_ = model;
+        accessStatus_ = accessStatus;
+
+        if (selectedSerial_.empty())
+        {
+            selectedSerial_ = serial;
+        }
+
+        if (selectedSerial_ == serial)
+        {
+            switchRequested_ = false;
+            lastError_.clear();
+        }
+    }
+
+    std::vector<CameraInfo> readCameraList(CameraList& camList)
+    {
+        std::vector<CameraInfo> cameras;
+        cameras.reserve(camList.GetSize());
+        for (unsigned int i = 0; i < camList.GetSize(); ++i)
+        {
+            CameraPtr cam = camList.GetByIndex(i);
+            INodeMap& tl = cam->GetTLDeviceNodeMap();
+            cameras.push_back(
+                {readStringNode(tl, "DeviceSerialNumber"), readStringNode(tl, "DeviceModelName"),
+                 readEnumNode(tl, "DeviceAccessStatus")});
+        }
+        return cameras;
+    }
+
+    CameraPtr chooseCamera(CameraList& camList, const std::string& requestedSerial)
     {
         const size_t cameraCount = static_cast<size_t>(camList.GetSize());
         {
@@ -296,7 +452,7 @@ class CameraStreamer
             return nullptr;
         }
 
-        if (serialFilter_.empty())
+        if (requestedSerial.empty())
         {
             return camList.GetByIndex(0);
         }
@@ -305,7 +461,7 @@ class CameraStreamer
         {
             CameraPtr cam = camList.GetByIndex(i);
             INodeMap& tl = cam->GetTLDeviceNodeMap();
-            if (readStringNode(tl, "DeviceSerialNumber") == serialFilter_)
+            if (readStringNode(tl, "DeviceSerialNumber") == requestedSerial)
             {
                 return cam;
             }
@@ -316,32 +472,42 @@ class CameraStreamer
 
     void captureOnce()
     {
+        std::unique_lock<std::mutex> sdkLock(sdkMutex_);
         SystemPtr system = System::GetInstance();
         CameraList camList = system->GetCameras();
+        updateCameraList(readCameraList(camList));
+        const std::string requestedSerial = selectedSerial();
 
-        CameraPtr cam = chooseCamera(camList);
+        CameraPtr cam = chooseCamera(camList, requestedSerial);
         if (cam == nullptr)
         {
             std::ostringstream error;
             error << "No matching camera found";
-            if (!serialFilter_.empty())
+            if (!requestedSerial.empty())
             {
-                error << " for serial " << serialFilter_;
+                error << " for serial " << requestedSerial;
             }
             setStatus(false, error.str());
             camList.Clear();
             system->ReleaseInstance();
+            sdkLock.unlock();
             std::this_thread::sleep_for(std::chrono::seconds(2));
             return;
         }
 
         INodeMap& tlDevice = cam->GetTLDeviceNodeMap();
+        std::string cameraSerial = readStringNode(tlDevice, "DeviceSerialNumber");
+        std::string cameraModel = readStringNode(tlDevice, "DeviceModelName");
+        std::string cameraAccessStatus = readEnumNode(tlDevice, "DeviceAccessStatus");
+        markCameraOpened(cameraSerial, cameraModel, cameraAccessStatus);
+
+        if (shouldSwitch(cameraSerial))
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            serial_ = readStringNode(tlDevice, "DeviceSerialNumber");
-            model_ = readStringNode(tlDevice, "DeviceModelName");
-            accessStatus_ = readEnumNode(tlDevice, "DeviceAccessStatus");
-            lastError_.clear();
+            cam = nullptr;
+            camList.Clear();
+            system->ReleaseInstance();
+            sdkLock.unlock();
+            return;
         }
 
         bool acquiring = false;
@@ -360,9 +526,15 @@ class CameraStreamer
             cam->BeginAcquisition();
             acquiring = true;
             setStatus(true, "");
+            sdkLock.unlock();
 
             while (running_ && g_running)
             {
+                if (shouldSwitch(cameraSerial))
+                {
+                    break;
+                }
+
                 ImagePtr image = cam->GetNextImage(1000);
                 if (image->IsIncomplete())
                 {
@@ -391,13 +563,22 @@ class CameraStreamer
         }
         catch (const Spinnaker::Exception& e)
         {
+            if (sdkLock.owns_lock())
+            {
+                sdkLock.unlock();
+            }
             setStatus(false, e.what());
         }
         catch (const std::exception& e)
         {
+            if (sdkLock.owns_lock())
+            {
+                sdkLock.unlock();
+            }
             setStatus(false, e.what());
         }
 
+        sdkLock.lock();
         try
         {
             if (acquiring)
@@ -420,10 +601,43 @@ class CameraStreamer
         cam = nullptr;
         camList.Clear();
         system->ReleaseInstance();
+        sdkLock.unlock();
 
         if (running_ && g_running)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    }
+
+    void discoverOnce()
+    {
+        std::lock_guard<std::mutex> sdkLock(sdkMutex_);
+        SystemPtr system = System::GetInstance();
+        CameraList camList = system->GetCameras();
+        updateCameraList(readCameraList(camList));
+        camList.Clear();
+        system->ReleaseInstance();
+    }
+
+    void discoveryLoop()
+    {
+        while (running_ && g_running)
+        {
+            try
+            {
+                discoverOnce();
+            }
+            catch (const Spinnaker::Exception&)
+            {
+            }
+            catch (const std::exception&)
+            {
+            }
+
+            for (int i = 0; i < 15 && running_ && g_running; ++i)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
     }
 
@@ -448,17 +662,21 @@ class CameraStreamer
         }
     }
 
-    std::string serialFilter_;
     std::atomic<bool> running_{true};
     std::thread worker_;
+    std::thread discoveryWorker_;
 
+    std::mutex sdkMutex_;
     mutable std::mutex mutex_;
     std::vector<uint8_t> latestBmp_;
+    std::vector<CameraInfo> cameras_;
     uint64_t frameId_ = 0;
     size_t width_ = 0;
     size_t height_ = 0;
     size_t cameraCount_ = 0;
     bool connected_ = false;
+    bool switchRequested_ = false;
+    std::string selectedSerial_;
     std::string serial_;
     std::string model_;
     std::string accessStatus_;
@@ -516,6 +734,23 @@ const char* kIndexHtml = R"HTML(<!doctype html>
       align-items: center;
       gap: 10px;
       color: var(--muted);
+    }
+    .source {
+      display: grid;
+      gap: 7px;
+      margin-bottom: 16px;
+    }
+    .source label {
+      color: var(--muted);
+    }
+    select {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 8px;
     }
     .dot {
       width: 10px;
@@ -617,6 +852,10 @@ const char* kIndexHtml = R"HTML(<!doctype html>
         <div id="empty" class="empty">Waiting for camera frames</div>
       </section>
       <aside>
+        <div class="source">
+          <label for="cameraSelect">Camera</label>
+          <select id="cameraSelect"></select>
+        </div>
         <dl>
           <dt>Camera</dt><dd id="camera">-</dd>
           <dt>Serial</dt><dd id="serial">-</dd>
@@ -636,8 +875,10 @@ const char* kIndexHtml = R"HTML(<!doctype html>
     const pause = document.getElementById('pause');
     const empty = document.getElementById('empty');
     const error = document.getElementById('error');
+    const cameraSelect = document.getElementById('cameraSelect');
     let paused = false;
     let delay = 35;
+    let cameraSelectDirty = false;
 
     function setStatus(s) {
       dot.className = 'dot ' + (s.connected ? 'live' : 'offline');
@@ -653,6 +894,45 @@ const char* kIndexHtml = R"HTML(<!doctype html>
       error.className = 'error' + (s.last_error ? ' visible' : '');
     }
 
+    function cameraLabel(camera) {
+      const model = camera.model || 'Camera';
+      const serial = camera.serial || 'unknown';
+      const active = camera.active ? ' - active' : '';
+      return `${model} (${serial})${active}`;
+    }
+
+    function setCameras(data) {
+      const currentValue = cameraSelect.value;
+      const selected = data.selected_serial || data.active_serial || '';
+      const cameras = data.cameras || [];
+      cameraSelect.innerHTML = '';
+
+      if (!cameras.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No cameras detected';
+        cameraSelect.appendChild(option);
+        cameraSelect.disabled = true;
+        cameraSelectDirty = false;
+        return;
+      }
+
+      cameraSelect.disabled = false;
+      for (const camera of cameras) {
+        const option = document.createElement('option');
+        option.value = camera.serial || '';
+        option.textContent = cameraLabel(camera);
+        cameraSelect.appendChild(option);
+      }
+
+      const exists = cameras.some(camera => camera.serial === selected);
+      cameraSelect.value = exists ? selected : (cameras[0].serial || '');
+      if (cameraSelectDirty && currentValue && cameras.some(camera => camera.serial === currentValue)) {
+        cameraSelect.value = currentValue;
+      }
+      cameraSelectDirty = false;
+    }
+
     async function pollStatus() {
       try {
         const response = await fetch('/status.json', { cache: 'no-store' });
@@ -662,6 +942,16 @@ const char* kIndexHtml = R"HTML(<!doctype html>
         state.textContent = 'Server unavailable';
       } finally {
         setTimeout(pollStatus, 700);
+      }
+    }
+
+    async function pollCameras() {
+      try {
+        const response = await fetch('/cameras.json', { cache: 'no-store' });
+        setCameras(await response.json());
+      } catch {
+      } finally {
+        setTimeout(pollCameras, 1200);
       }
     }
 
@@ -684,8 +974,18 @@ const char* kIndexHtml = R"HTML(<!doctype html>
       pause.textContent = paused ? 'Resume' : 'Pause';
       if (!paused) nextFrame();
     };
+    cameraSelect.onchange = async () => {
+      cameraSelectDirty = true;
+      const serial = cameraSelect.value;
+      empty.style.display = 'grid';
+      try {
+        await fetch(`/select?serial=${encodeURIComponent(serial)}`, { cache: 'no-store' });
+      } catch {
+      }
+    };
 
     pollStatus();
+    pollCameras();
     nextFrame();
   </script>
 </body>
@@ -797,9 +1097,11 @@ class HttpServer
         std::string version;
         request >> method >> path >> version;
 
+        std::string queryString;
         size_t query = path.find('?');
         if (query != std::string::npos)
         {
+            queryString = path.substr(query + 1);
             path = path.substr(0, query);
         }
 
@@ -817,6 +1119,17 @@ class HttpServer
         }
         else if (path == "/status.json")
         {
+            sendText(client, 200, "OK", "application/json; charset=utf-8", streamer_.statusJson(),
+                     "Cache-Control: no-store\r\n");
+        }
+        else if (path == "/cameras.json")
+        {
+            sendText(client, 200, "OK", "application/json; charset=utf-8", streamer_.camerasJson(),
+                     "Cache-Control: no-store\r\n");
+        }
+        else if (path == "/select")
+        {
+            streamer_.selectCamera(queryValue(queryString, "serial"));
             sendText(client, 200, "OK", "application/json; charset=utf-8", streamer_.statusJson(),
                      "Cache-Control: no-store\r\n");
         }
