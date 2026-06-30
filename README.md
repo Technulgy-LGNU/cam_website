@@ -32,6 +32,9 @@ Useful options:
 --serial SERIAL     Use a specific camera serial number
 --bind ADDRESS      Bind address, default 0.0.0.0
 --port PORT         HTTP port, default 8080
+--jpeg-quality N    JPEG quality 1-100, default 75
+--stream-width PX   Maximum streamed image width, default 1280, 0 disables resizing
+--stream-fps FPS    Maximum streamed frame rate, default 10
 --help              Show options
 ```
 
@@ -67,7 +70,8 @@ sudo systemctl disable cam_website.service
 ## Notes
 
 - The app uses Spinnaker directly through the native C++ SDK; no Python packages or web frameworks are required.
-- The browser polls `/frame.bmp` for the newest frame, `/status.json` for camera state, and `/cameras.json` for hotplug discovery.
+- The browser polls `/frame.jpg` for the newest JPEG frame, `/status.json` for camera state, and `/cameras.json` for hotplug discovery.
+- Streaming uses color JPEG compression by default at quality 75, maximum width 1280, and 10 FPS to reduce bandwidth. Tune with `--jpeg-quality`, `--stream-width`, and `--stream-fps`.
 - The camera dropdown switches cameras through `/select?serial=SERIAL` without restarting the process.
 - If no camera is found, a selected camera drops, or a selected camera is not currently reachable, the capture loop retries automatically.
 - For GigE cameras, make sure the camera is reachable on the host network and configured with Spinnaker's GigE tools if it is on the wrong subnet.

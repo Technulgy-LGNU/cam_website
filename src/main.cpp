@@ -1,10 +1,14 @@
 #include "Spinnaker.h"
+#include "ImageUtility.h"
 #include "SpinGenApi/SpinnakerGenApi.h"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -37,18 +41,17 @@ void handleSignal(int)
     g_running = false;
 }
 
-void writeLe16(std::vector<uint8_t>& out, uint16_t value)
+uint32_t parseUint32(const std::string& value, const char* name, uint32_t minValue, uint32_t maxValue)
 {
-    out.push_back(static_cast<uint8_t>(value & 0xff));
-    out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
-}
-
-void writeLe32(std::vector<uint8_t>& out, uint32_t value)
-{
-    out.push_back(static_cast<uint8_t>(value & 0xff));
-    out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
-    out.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
-    out.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+    size_t parsed = 0;
+    unsigned long number = std::stoul(value, &parsed);
+    if (parsed != value.size() || number < minValue || number > maxValue)
+    {
+        std::ostringstream message;
+        message << name << " must be between " << minValue << " and " << maxValue;
+        throw std::runtime_error(message.str());
+    }
+    return static_cast<uint32_t>(number);
 }
 
 std::string jsonEscape(const std::string& input)
@@ -205,54 +208,41 @@ std::string readEnumNode(INodeMap& nodeMap, const char* nodeName)
     return {};
 }
 
-std::vector<uint8_t> makeBmpFromRgb8(const uint8_t* rgb, size_t width, size_t height, size_t stride)
+std::vector<uint8_t> readFileBytes(const std::string& path)
 {
-    if (width == 0 || height == 0 || width > 65535 || height > 65535)
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in)
     {
-        throw std::runtime_error("invalid frame dimensions");
+        throw std::runtime_error("failed to open encoded JPEG");
     }
 
-    const uint32_t rowSize = static_cast<uint32_t>(((width * 3) + 3) & ~static_cast<size_t>(3));
-    const uint32_t pixelSize = rowSize * static_cast<uint32_t>(height);
-    const uint32_t fileSize = 54 + pixelSize;
-
-    std::vector<uint8_t> out;
-    out.reserve(fileSize);
-
-    out.push_back('B');
-    out.push_back('M');
-    writeLe32(out, fileSize);
-    writeLe16(out, 0);
-    writeLe16(out, 0);
-    writeLe32(out, 54);
-    writeLe32(out, 40);
-    writeLe32(out, static_cast<uint32_t>(width));
-    writeLe32(out, static_cast<uint32_t>(height));
-    writeLe16(out, 1);
-    writeLe16(out, 24);
-    writeLe32(out, 0);
-    writeLe32(out, pixelSize);
-    writeLe32(out, 2835);
-    writeLe32(out, 2835);
-    writeLe32(out, 0);
-    writeLe32(out, 0);
-
-    const size_t padding = rowSize - (width * 3);
-    const uint8_t pad[3] = {0, 0, 0};
-
-    for (size_t y = 0; y < height; ++y)
+    const std::streamoff size = in.tellg();
+    if (size <= 0)
     {
-        const uint8_t* src = rgb + ((height - 1 - y) * stride);
-        for (size_t x = 0; x < width; ++x)
-        {
-            out.push_back(src[x * 3 + 2]);
-            out.push_back(src[x * 3 + 1]);
-            out.push_back(src[x * 3 + 0]);
-        }
-        out.insert(out.end(), pad, pad + padding);
+        throw std::runtime_error("encoded JPEG is empty");
     }
 
-    return out;
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    in.seekg(0, std::ios::beg);
+    if (!in.read(reinterpret_cast<char*>(bytes.data()), size))
+    {
+        throw std::runtime_error("failed to read encoded JPEG");
+    }
+    return bytes;
+}
+
+std::vector<uint8_t> makeJpegFromImage(const ImagePtr& image, uint32_t quality)
+{
+    static const std::string path = "/tmp/cam_website_frame_" + std::to_string(::getpid()) + ".jpg";
+
+    JPEGOption option;
+    option.quality = quality;
+    option.progressive = false;
+    image->Save(path.c_str(), option);
+
+    std::vector<uint8_t> bytes = readFileBytes(path);
+    std::remove(path.c_str());
+    return bytes;
 }
 
 struct AppConfig
@@ -260,6 +250,9 @@ struct AppConfig
     std::string bindAddress = "0.0.0.0";
     uint16_t port = 8080;
     std::string serial;
+    uint32_t jpegQuality = 75;
+    uint32_t streamMaxWidth = 1280;
+    uint32_t streamFps = 10;
 };
 
 struct CameraInfo
@@ -272,7 +265,13 @@ struct CameraInfo
 class CameraStreamer
 {
   public:
-    explicit CameraStreamer(std::string serial) : selectedSerial_(std::move(serial)) {}
+    explicit CameraStreamer(std::string serial, uint32_t jpegQuality, uint32_t streamMaxWidth, uint32_t streamFps)
+        : selectedSerial_(std::move(serial)),
+          jpegQuality_(jpegQuality),
+          streamMaxWidth_(streamMaxWidth),
+          streamFps_(streamFps)
+    {
+    }
 
     void start()
     {
@@ -304,7 +303,7 @@ class CameraStreamer
         selectedSerial_ = serial;
         switchRequested_ = true;
         connected_ = false;
-        latestBmp_.clear();
+        latestJpeg_.clear();
         width_ = 0;
         height_ = 0;
         frameId_ = 0;
@@ -314,11 +313,11 @@ class CameraStreamer
     bool latestFrame(std::vector<uint8_t>& frame, uint64_t& frameId, size_t& width, size_t& height) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (latestBmp_.empty())
+        if (latestJpeg_.empty())
         {
             return false;
         }
-        frame = latestBmp_;
+        frame = latestJpeg_;
         frameId = frameId_;
         width = width_;
         height = height_;
@@ -335,6 +334,9 @@ class CameraStreamer
         out << "\"frame_id\":" << frameId_ << ",";
         out << "\"width\":" << width_ << ",";
         out << "\"height\":" << height_ << ",";
+        out << "\"jpeg_quality\":" << jpegQuality_ << ",";
+        out << "\"stream_max_width\":" << streamMaxWidth_ << ",";
+        out << "\"stream_fps\":" << streamFps_ << ",";
         out << "\"camera_count\":" << cameraCount_ << ",";
         out << "\"selected_serial\":\"" << jsonEscape(selectedSerial_) << "\",";
         out << "\"serial\":\"" << jsonEscape(serial_) << "\",";
@@ -389,7 +391,7 @@ class CameraStreamer
         {
             width_ = 0;
             height_ = 0;
-            latestBmp_.clear();
+            latestJpeg_.clear();
         }
     }
 
@@ -522,6 +524,8 @@ class CameraStreamer
 
             ImageProcessor processor;
             processor.SetColorProcessing(SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR);
+            auto lastEncoded = std::chrono::steady_clock::time_point::min();
+            const auto encodeInterval = std::chrono::milliseconds(1000 / std::max<uint32_t>(1, streamFps_));
 
             cam->BeginAcquisition();
             acquiring = true;
@@ -544,16 +548,31 @@ class CameraStreamer
                     continue;
                 }
 
+                const auto now = std::chrono::steady_clock::now();
+                if (lastEncoded != std::chrono::steady_clock::time_point::min() && now - lastEncoded < encodeInterval)
+                {
+                    image->Release();
+                    continue;
+                }
+
                 ImagePtr rgb = processor.Convert(image, PixelFormat_RGB8);
-                std::vector<uint8_t> bmp = makeBmpFromRgb8(
-                    static_cast<const uint8_t*>(rgb->GetData()), rgb->GetWidth(), rgb->GetHeight(), rgb->GetStride());
+                ImagePtr output = rgb;
+                if (streamMaxWidth_ > 0 && rgb->GetWidth() > streamMaxWidth_)
+                {
+                    const size_t divisor = (rgb->GetWidth() + streamMaxWidth_ - 1) / streamMaxWidth_;
+                    const double scale = 1.0 / static_cast<double>(divisor);
+                    output = ImageUtility::CreateScaled(rgb, SPINNAKER_IMAGE_SCALING_ALGORITHM_NEAREST_NEIGHBOR, scale);
+                }
+
+                std::vector<uint8_t> jpeg = makeJpegFromImage(output, jpegQuality_);
+                lastEncoded = now;
 
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    latestBmp_ = std::move(bmp);
+                    latestJpeg_ = std::move(jpeg);
                     frameId_ = image->GetFrameID();
-                    width_ = rgb->GetWidth();
-                    height_ = rgb->GetHeight();
+                    width_ = output->GetWidth();
+                    height_ = output->GetHeight();
                     connected_ = true;
                     lastError_.clear();
                 }
@@ -668,7 +687,7 @@ class CameraStreamer
 
     std::mutex sdkMutex_;
     mutable std::mutex mutex_;
-    std::vector<uint8_t> latestBmp_;
+    std::vector<uint8_t> latestJpeg_;
     std::vector<CameraInfo> cameras_;
     uint64_t frameId_ = 0;
     size_t width_ = 0;
@@ -681,6 +700,9 @@ class CameraStreamer
     std::string model_;
     std::string accessStatus_;
     std::string lastError_ = "Starting";
+    uint32_t jpegQuality_ = 75;
+    uint32_t streamMaxWidth_ = 1280;
+    uint32_t streamFps_ = 10;
 };
 
 const char* kIndexHtml = R"HTML(<!doctype html>
@@ -877,10 +899,14 @@ const char* kIndexHtml = R"HTML(<!doctype html>
     const error = document.getElementById('error');
     const cameraSelect = document.getElementById('cameraSelect');
     let paused = false;
-    let delay = 35;
+    let frameDelay = 100;
+    let delay = frameDelay;
     let cameraSelectDirty = false;
 
     function setStatus(s) {
+      if (s.stream_fps) {
+        frameDelay = Math.max(33, Math.round(1000 / s.stream_fps));
+      }
       dot.className = 'dot ' + (s.connected ? 'live' : 'offline');
       state.textContent = s.connected ? 'Live' : 'Offline';
       document.getElementById('camera').textContent = s.model || '-';
@@ -957,11 +983,11 @@ const char* kIndexHtml = R"HTML(<!doctype html>
 
     function nextFrame() {
       if (paused) return;
-      img.src = `/frame.bmp?t=${Date.now()}`;
+      img.src = `/frame.jpg?t=${Date.now()}`;
     }
 
     img.onload = () => {
-      delay = 35;
+      delay = frameDelay;
       empty.style.display = 'none';
       setTimeout(nextFrame, delay);
     };
@@ -1133,7 +1159,7 @@ class HttpServer
             sendText(client, 200, "OK", "application/json; charset=utf-8", streamer_.statusJson(),
                      "Cache-Control: no-store\r\n");
         }
-        else if (path == "/frame.bmp" || path == "/snapshot.bmp")
+        else if (path == "/frame.jpg" || path == "/snapshot.jpg")
         {
             std::vector<uint8_t> frame;
             uint64_t frameId = 0;
@@ -1151,7 +1177,7 @@ class HttpServer
                 extra << "X-Frame-Id: " << frameId << "\r\n";
                 extra << "X-Image-Width: " << width << "\r\n";
                 extra << "X-Image-Height: " << height << "\r\n";
-                sendResponse(client, 200, "OK", "image/bmp", frame, extra.str());
+                sendResponse(client, 200, "OK", "image/jpeg", frame, extra.str());
             }
         }
         else
@@ -1197,9 +1223,22 @@ AppConfig parseArgs(int argc, char** argv)
         {
             config.serial = needValue("--serial");
         }
+        else if (arg == "--jpeg-quality")
+        {
+            config.jpegQuality = parseUint32(needValue("--jpeg-quality"), "--jpeg-quality", 1, 100);
+        }
+        else if (arg == "--stream-width")
+        {
+            config.streamMaxWidth = parseUint32(needValue("--stream-width"), "--stream-width", 0, 10000);
+        }
+        else if (arg == "--stream-fps")
+        {
+            config.streamFps = parseUint32(needValue("--stream-fps"), "--stream-fps", 1, 60);
+        }
         else if (arg == "--help" || arg == "-h")
         {
-            std::cout << "Usage: cam_website [--bind ADDRESS] [--port PORT] [--serial SERIAL]\n";
+            std::cout << "Usage: cam_website [--bind ADDRESS] [--port PORT] [--serial SERIAL]\n"
+                         "                   [--jpeg-quality 1-100] [--stream-width PIXELS] [--stream-fps FPS]\n";
             std::exit(0);
         }
         else
@@ -1219,7 +1258,7 @@ int main(int argc, char** argv)
     try
     {
         AppConfig config = parseArgs(argc, argv);
-        CameraStreamer streamer(config.serial);
+        CameraStreamer streamer(config.serial, config.jpegQuality, config.streamMaxWidth, config.streamFps);
         streamer.start();
 
         try
